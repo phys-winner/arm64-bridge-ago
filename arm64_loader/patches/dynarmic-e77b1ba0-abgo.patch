@@ -1,0 +1,82 @@
+diff --git a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+index 909dde73..29109bdf 100644
+--- a/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
++++ b/src/dynarmic/backend/arm64/emit_arm64_a32.cpp
+@@ -33,8 +33,19 @@ oaknut::Label EmitA32Cond(oaknut::CodeGenerator& code, EmitContext&, IR::Cond co
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Terminal terminal, IR::LocationDescriptor initial_location, bool is_single_step);
+ 
+-void EmitA32Terminal(oaknut::CodeGenerator&, EmitContext&, IR::Term::Interpret, IR::LocationDescriptor, bool) {
+-    ASSERT_FALSE("Interpret should never be emitted.");
++void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::Interpret terminal, IR::LocationDescriptor initial_location, bool) {
++    // MC4 arm32-to-arm64 bridge patch: the A32 frontend emits Interpret for
++    // instructions this backend does not implement (CPS, MRS, LDM user
++    // variants, ...). The upstream x64 backend calls UserCallbacks::
++    // InterpreterFallback here; the arm64 backend has no interpreter, and
++    // asserting aborts the whole process mid-game. Treat the instruction as
++    // a no-op instead: advance past it and return to the dispatcher, which
++    // JITs the next instruction.
++    const A32::LocationDescriptor next{terminal.next};
++    const u32 advance = next.TFlag() ? 2 : 4;
++    code.MOV(Wscratch1, next.PC() + advance);
++    code.STR(Wscratch1, Xstate, offsetof(A32JitState, regs) + sizeof(u32) * 15);
++    EmitRelocation(code, ctx, LinkTarget::ReturnToDispatcher);
+ }
+ 
+ void EmitA32Terminal(oaknut::CodeGenerator& code, EmitContext& ctx, IR::Term::ReturnToDispatch, IR::LocationDescriptor, bool) {
+diff --git a/src/dynarmic/frontend/A32/decoder/asimd.inc b/src/dynarmic/frontend/A32/decoder/asimd.inc
+index d0dfd867..422e2138 100644
+--- a/src/dynarmic/frontend/A32/decoder/asimd.inc
++++ b/src/dynarmic/frontend/A32/decoder/asimd.inc
+@@ -59,7 +59,7 @@ INST(v8_SHA256SU1,          "SHA256SU1",                "111100110D10nnnndddd110
+ // Three registers of different lengths
+ INST(asimd_VADDL,           "VADDL/VADDW",              "1111001U1Dzznnnndddd000oN0M0mmmm") // ASIMD
+ INST(asimd_VSUBL,           "VSUBL/VSUBW",              "1111001U1Dzznnnndddd001oN0M0mmmm") // ASIMD
+-//INST(asimd_VADDHN,          "VADDHN",                   "111100101-----------0100-0-0----") // ASIMD
++INST(asimd_VADDHN,           "VADDHN",                  "111100101Dzznnnndddd0100N0M0mmmm") // ASIMD
+ //INST(asimd_VRADDHN,         "VRADDHN",                  "111100111-----------0100-0-0----") // ASIMD
+ INST(asimd_VABAL,           "VABAL",                    "1111001U1Dzznnnndddd0101N0M0mmmm") // ASIMD
+ //INST(asimd_VSUBHN,          "VSUBHN",                   "111100101-----------0110-0-0----") // ASIMD
+diff --git a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+index 44ac2450..2bc6787c 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
++++ b/src/dynarmic/frontend/A32/translate/impl/a32_translate_impl.h
+@@ -887,6 +887,7 @@ struct TranslatorVisitor final {
+ 
+     // Advanced SIMD three registers with different lengths
+     bool asimd_VADDL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm);
++    bool asimd_VADDHN(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+     bool asimd_VSUBL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm);
+     bool asimd_VABAL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+     bool asimd_VABDL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm);
+diff --git a/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp b/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
+index a69f39bf..37aa6e7b 100644
+--- a/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
++++ b/src/dynarmic/frontend/A32/translate/impl/asimd_three_regs.cpp
+@@ -905,6 +905,26 @@ bool TranslatorVisitor::asimd_VADDL(bool U, bool D, size_t sz, size_t Vn, size_t
+     });
+ }
+ 
++bool TranslatorVisitor::asimd_VADDHN(bool D, size_t sz, size_t Vn, size_t Vd, bool N, bool M, size_t Vm) {
++    if (sz == 0b11) {
++        return DecodeError();
++    }
++
++    const size_t esize = 8U << sz;
++    const auto d = ToVector(false, Vd, D);
++    const auto m = ToVector(true, Vm, M);
++    const auto n = ToVector(true, Vn, N);
++
++    const auto reg_m = ir.GetVector(m);
++    const auto reg_n = ir.GetVector(n);
++    const auto sum = ir.VectorAdd(2 * esize, reg_n, reg_m);
++    const auto result = ir.VectorNarrow(2 * esize,
++                                        ir.VectorLogicalShiftRight(2 * esize, sum,
++                                                                   static_cast<u8>(esize)));
++    ir.SetVector(d, result);
++    return true;
++}
++
+ bool TranslatorVisitor::asimd_VSUBL(bool U, bool D, size_t sz, size_t Vn, size_t Vd, bool op, bool N, bool M, size_t Vm) {
+     return WideInstruction(*this, U, D, sz, Vn, Vd, N, M, Vm, op ? WidenBehaviour::Second : WidenBehaviour::Both, [this](size_t esize, const auto&, const auto& reg_n, const auto& reg_m) {
+         return ir.VectorSub(esize, reg_n, reg_m);
